@@ -1,0 +1,172 @@
+From 4d55356e918fd75a07d05db3ea28798a016405a4 Mon Sep 17 00:00:00 2001
+From: Alex Denes <caskd@redxen.eu>
+Date: Thu, 10 Jul 2025 12:01:29 +0000
+Subject: [PATCH] Implement color manager
+
+---
+ Makefile     |  6 +++++-
+ config.def.h |  8 +++++---
+ config.mk    |  4 ++--
+ dwl.c        | 50 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 62 insertions(+), 6 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 578194f..570d5f5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -21,7 +21,8 @@ dwl: dwl.o util.o
+ 	$(CC) dwl.o util.o $(DWLCFLAGS) $(LDFLAGS) $(LDLIBS) -o $@
+ dwl.o: dwl.c client.h config.h config.mk cursor-shape-v1-protocol.h \
+ 	pointer-constraints-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h \
+-	wlr-output-power-management-unstable-v1-protocol.h xdg-shell-protocol.h
++	wlr-output-power-management-unstable-v1-protocol.h xdg-shell-protocol.h \
++	color-management-v1-protocol.h
+ util.o: util.c util.h
+ 
+ # wayland-scanner is a tool which generates C headers and rigging for Wayland
+@@ -39,6 +40,9 @@ pointer-constraints-unstable-v1-protocol.h:
+ wlr-layer-shell-unstable-v1-protocol.h:
+ 	$(WAYLAND_SCANNER) enum-header \
+ 		protocols/wlr-layer-shell-unstable-v1.xml $@
++color-management-v1-protocol.h:
++	$(WAYLAND_SCANNER) enum-header \
++		$(WAYLAND_PROTOCOLS)/staging/color-management/color-management-v1.xml $@
+ wlr-output-power-management-unstable-v1-protocol.h:
+ 	$(WAYLAND_SCANNER) server-header \
+ 		protocols/wlr-output-power-management-unstable-v1.xml $@
+diff --git a/config.def.h b/config.def.h
+index 95c2afa..43af85b 100644
+--- a/config.def.h
++++ b/config.def.h
+@@ -43,12 +43,14 @@ static const Layout layouts[] = {
+ */
+ /* NOTE: ALWAYS add a fallback rule, even if you are completely sure it won't be used */
+ static const MonitorRule monrules[] = {
+-	/* name       mfact  nmaster scale layout       rotate/reflect                x    y */
++	/* name       mfact  nmaster scale layout       rotate/reflect                x    y   hdr  render_format */
+ 	/* example of a HiDPI laptop monitor:
+-	{ "eDP-1",    0.5f,  1,      2,    &layouts[0], WL_OUTPUT_TRANSFORM_NORMAL,   -1,  -1 },
++	{ "eDP-1",    0.5f,  1,      2,    &layouts[0], WL_OUTPUT_TRANSFORM_NORMAL,   -1,  -1,   0, DRM_FORMAT_XRGB8888 },
++	 * HDR Example
++	{ NULL,       0.55f, 1,      1,    &layouts[0], WL_OUTPUT_TRANSFORM_NORMAL,   -1,  -1,   1, DRM_FORMAT_XRGB2101010 },
+ 	*/
+ 	/* defaults */
+-	{ NULL,       0.55f, 1,      1,    &layouts[0], WL_OUTPUT_TRANSFORM_NORMAL,   -1,  -1 },
++	{ NULL,       0.55f, 1,      1,    &layouts[0], WL_OUTPUT_TRANSFORM_NORMAL,   -1,  -1,   0, DRM_FORMAT_XRGB8888 },
+ };
+ 
+ /* keyboard */
+diff --git a/config.mk b/config.mk
+index eb08a05..f641d04 100644
+--- a/config.mk
++++ b/config.mk
+@@ -8,8 +8,8 @@ PREFIX = /usr/local
+ MANDIR = $(PREFIX)/share/man
+ DATADIR = $(PREFIX)/share
+ 
+-WLR_INCS = `$(PKG_CONFIG) --cflags wlroots-0.19`
+-WLR_LIBS = `$(PKG_CONFIG) --libs wlroots-0.19`
++WLR_INCS = `$(PKG_CONFIG) --cflags wlroots-0.20`
++WLR_LIBS = `$(PKG_CONFIG) --libs wlroots-0.20`
+ 
+ # Allow using an alternative wlroots installation
+ # This has to have all the includes required by wlroots, e.g:
+diff --git a/dwl.c b/dwl.c
+index 12f441e..39812ce 100644
+--- a/dwl.c
++++ b/dwl.c
+@@ -4,6 +4,7 @@
+ #include <getopt.h>
+ #include <libinput.h>
+ #include <linux/input-event-codes.h>
++#include <drm_fourcc.h>
+ #include <math.h>
+ #include <signal.h>
+ #include <stdio.h>
+@@ -18,6 +19,7 @@
+ #include <wlr/render/wlr_renderer.h>
+ #include <wlr/types/wlr_alpha_modifier_v1.h>
+ #include <wlr/types/wlr_compositor.h>
++#include <wlr/types/wlr_color_management_v1.h>
+ #include <wlr/types/wlr_cursor.h>
+ #include <wlr/types/wlr_cursor_shape_v1.h>
+ #include <wlr/types/wlr_data_control_v1.h>
+@@ -215,6 +217,9 @@ typedef struct {
+ 	const Layout *lt;
+ 	enum wl_output_transform rr;
+ 	int x, y;
++
++	int hdr;
++	uint32_t render_format;
+ } MonitorRule;
+ 
+ typedef struct {
+@@ -382,6 +387,7 @@ static struct wlr_virtual_keyboard_manager_v1 *virtual_keyboard_mgr;
+ static struct wlr_virtual_pointer_manager_v1 *virtual_pointer_mgr;
+ static struct wlr_cursor_shape_manager_v1 *cursor_shape_mgr;
+ static struct wlr_output_power_manager_v1 *power_mgr;
++static struct wlr_color_manager_v1 *color_mgr;
+ 
+ static struct wlr_pointer_constraints_v1 *pointer_constraints;
+ static struct wlr_relative_pointer_manager_v1 *relative_pointer_mgr;
+@@ -1084,6 +1090,19 @@ createmon(struct wl_listener *listener, void *data)
+ 	LISTEN(&wlr_output->events.destroy, &m->destroy, cleanupmon);
+ 	LISTEN(&wlr_output->events.request_state, &m->request_state, requestmonstate);
+ 
++	/* Enable HDR if supported and desired */
++	if ((r->hdr) &&
++	    (wlr_output->supported_primaries & WLR_COLOR_NAMED_PRIMARIES_BT2020) &&
++	    (wlr_output->supported_transfer_functions & WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ) &&
++	    (drw->features.output_color_transform)) {
++		const struct wlr_output_image_description image_desc = {
++			.primaries = WLR_COLOR_NAMED_PRIMARIES_BT2020,
++			.transfer_function = WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ,
++		};
++		wlr_output_state_set_render_format(&state, r->render_format);
++		wlr_output_state_set_image_description(&state, &image_desc);
++	}
++
+ 	wlr_output_state_set_enabled(&state, 1);
+ 	wlr_output_commit_state(wlr_output, &state);
+ 	wlr_output_state_finish(&state);
+@@ -2645,6 +2664,37 @@ setup(void)
+ 	wl_signal_add(&output_mgr->events.apply, &output_mgr_apply);
+ 	wl_signal_add(&output_mgr->events.test, &output_mgr_test);
+ 
++	if (drw->features.input_color_transform) {
++		struct wlr_color_manager_v1_options *color_mgr_options;
++		color_mgr_options = ecalloc(1, sizeof(*color_mgr_options));
++
++		// Enable only supported wlroots features
++		color_mgr_options->features = (struct wlr_color_manager_v1_features){
++			.parametric = true,
++			.set_mastering_display_primaries = true,
++		};
++
++		color_mgr_options->render_intents_len = 2;
++		enum wp_color_manager_v1_render_intent *render_intents = ecalloc(color_mgr_options->render_intents_len, sizeof(*render_intents));
++		render_intents[0] = WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL;
++		render_intents[1] = WP_COLOR_MANAGER_V1_RENDER_INTENT_ABSOLUTE;
++		color_mgr_options->render_intents = render_intents;
++
++		enum wp_color_manager_v1_primaries *primaries = ecalloc(color_mgr_options->primaries_len, sizeof(*primaries));
++		primaries[0] = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB;
++		primaries[1] = WP_COLOR_MANAGER_V1_PRIMARIES_BT2020;
++		color_mgr_options->primaries = primaries;
++
++		color_mgr_options->transfer_functions_len = 3;
++		enum wp_color_manager_v1_transfer_function *transfer_functions = ecalloc(color_mgr_options->transfer_functions_len, sizeof(*transfer_functions));
++		transfer_functions[0] = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB;
++		transfer_functions[1] = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ;
++		transfer_functions[2] = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR;
++		color_mgr_options->transfer_functions = transfer_functions;
++
++		color_mgr = wlr_color_manager_v1_create(dpy, 1, color_mgr_options);
++	}
++
+ 	/* Make sure XWayland clients don't connect to the parent X server,
+ 	 * e.g when running in the x11 backend or the wayland backend and the
+ 	 * compositor has Xwayland support */
+-- 
+2.51.0
+
