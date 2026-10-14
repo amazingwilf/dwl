@@ -9,7 +9,7 @@ DWLCPPFLAGS = -I. -DWLR_USE_UNSTABLE -D_POSIX_C_SOURCE=200809L \
 DWLDEVCFLAGS = -g -Wpedantic -Wall -Wextra -Wdeclaration-after-statement \
 	-Wno-unused-parameter -Wshadow -Wunused-macros -Werror=strict-prototypes \
 	-Werror=implicit -Werror=return-type -Werror=incompatible-pointer-types \
-	-Wfloat-conversion
+	-Wfloat-conversion -Wno-unused-function
 
 # CFLAGS / LDFLAGS
 PKGS      = wayland-server xkbcommon libinput $(XLIBS)
@@ -51,7 +51,9 @@ xdg-shell-protocol.h:
 config.h:
 	cp config.def.h $@
 clean:
-	rm -f dwl *.o *-protocol.h
+	rm -f dwl *.o *-protocol.h config.h
+cleanup: clean
+	rm -f *.orig *.rej
 
 dist: clean
 	mkdir -p dwl-$(VERSION)
